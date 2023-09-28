@@ -320,37 +320,56 @@ pub fn load_sigpaths_from_zip<P: AsRef<Path>>(
     Ok((signature_paths, temp_dir))
 }
 
+enum CSVType {
+    Assembly,
+    Reads,
+    Unknown,
+}
+
+fn detect_csv_type(headers: &csv::StringRecord) -> CSVType {
+    if headers.len() == 3
+        && headers.get(0).unwrap() == "name"
+        && headers.get(1).unwrap() == "genome_filename"
+        && headers.get(2).unwrap() == "protein_filename"
+    {
+        CSVType::Assembly
+    } else if headers.len() == 3
+        && headers.get(0).unwrap() == "name"
+        && headers.get(1).unwrap() == "read1"
+        && headers.get(2).unwrap() == "read2"
+    {
+        CSVType::Reads
+    } else {
+        CSVType::Unknown
+    }
+}
+
 pub fn load_fasta_fromfile<P: AsRef<Path>>(
     sketchlist_filename: &P,
-) -> Result<Vec<(String, PathBuf, String)>> {
+) -> Result<Vec<(String, Vec<PathBuf>, String)>> {
     let mut rdr = csv::Reader::from_path(sketchlist_filename)?;
-
-    // Check for right header
     let headers = rdr.headers()?;
-    if headers.len() != 3
-        || headers.get(0).unwrap() != "name"
-        || headers.get(1).unwrap() != "genome_filename"
-        || headers.get(2).unwrap() != "protein_filename"
-    {
-        return Err(anyhow!(
-            "Invalid header. Expected 'name,genome_filename,protein_filename', but got '{}'",
+
+    match detect_csv_type(&headers) {
+        CSVType::Assembly => process_assembly_csv(rdr),
+        CSVType::Reads => process_reads_csv(rdr),
+        CSVType::Unknown => Err(anyhow!(
+            "Invalid header. Expected 'name,genome_filename,protein_filename' or 'name,read1,read2', but got '{}'",
             headers.iter().collect::<Vec<_>>().join(",")
-        ));
+        )),
     }
+}
 
+fn process_assembly_csv(mut rdr: csv::Reader<std::fs::File>) -> Result<Vec<(String, Vec<PathBuf>, String)>> {
     let mut results = Vec::new();
-
     let mut row_count = 0;
     let mut genome_count = 0;
     let mut protein_count = 0;
-    // Create a HashSet to keep track of processed rows.
     let mut processed_rows = std::collections::HashSet::new();
     let mut duplicate_count = 0;
 
     for result in rdr.records() {
         let record = result?;
-
-        // Skip duplicated rows
         let row_string = record.iter().collect::<Vec<_>>().join(",");
         if processed_rows.contains(&row_string) {
             duplicate_count += 1;
@@ -369,7 +388,7 @@ pub fn load_fasta_fromfile<P: AsRef<Path>>(
         if !genome_filename.is_empty() {
             results.push((
                 name.clone(),
-                PathBuf::from(genome_filename),
+                vec![PathBuf::from(genome_filename)],
                 "dna".to_string(),
             ));
             genome_count += 1;
@@ -379,11 +398,15 @@ pub fn load_fasta_fromfile<P: AsRef<Path>>(
             .get(2)
             .ok_or_else(|| anyhow!("Missing 'protein_filename' field"))?;
         if !protein_filename.is_empty() {
-            results.push((name, PathBuf::from(protein_filename), "protein".to_string()));
+            results.push((
+                name,
+                vec![PathBuf::from(protein_filename)],
+                "protein".to_string(),
+            ));
             protein_count += 1;
         }
     }
-    // Print warning if there were duplicated rows.
+
     if duplicate_count > 0 {
         println!("Warning: {} duplicated rows were skipped.", duplicate_count);
     }
@@ -391,8 +414,167 @@ pub fn load_fasta_fromfile<P: AsRef<Path>>(
         "Loaded {} rows in total ({} genome and {} protein files)",
         row_count, genome_count, protein_count
     );
+
     Ok(results)
 }
+
+
+fn process_reads_csv(mut rdr: csv::Reader<std::fs::File>) -> Result<Vec<(String, Vec<PathBuf>, String)>> {
+    let mut results = Vec::new();
+    let mut processed_rows = std::collections::HashSet::new();
+    let mut duplicate_count = 0;
+
+    for result in rdr.records() {
+        let record = result?;
+        let row_string = record.iter().collect::<Vec<_>>().join(",");
+        if processed_rows.contains(&row_string) {
+            duplicate_count += 1;
+            continue;
+        }
+        processed_rows.insert(row_string.clone());
+
+        let name = record
+            .get(0)
+            .ok_or_else(|| anyhow!("Missing 'name' field"))?
+            .to_string();
+
+        let read1 = record
+            .get(1)
+            .ok_or_else(|| anyhow!("Missing 'read1' field"))?;
+        let read2 = record
+            .get(2)
+            .ok_or_else(|| anyhow!("Missing 'read2' field"))?;
+        let paths = vec![
+            PathBuf::from(read1),
+            PathBuf::from(read2),
+        ];
+        results.push((name, paths, "alternate".to_string()));
+    }
+
+    if duplicate_count > 0 {
+        println!("Warning: {} duplicated rows were skipped.", duplicate_count);
+    }
+    println!("Loaded alternate CSV variant.");
+
+    Ok(results)
+}
+
+
+fn sketch_fastas(
+    filenames: &[PathBuf], 
+    moltype: &str, 
+    name: &str, 
+    params_vec: &[YourParamType]  // Replace `YourParamType` with the appropriate type
+) -> Result<Vec<Signature>, String> {
+    // initialize signatures once for all files
+    // in sourmash sketch, if merging multiple files, the `filename` ends up being the last file processed.
+    // do we want to mirror that behavior? or is there a better option?
+    let (mut sigs, sig_params) = build_siginfo(&params_vec, moltype, name, &filenames[0]);
+
+    for filename in filenames.iter() {
+        let mut reader = match needletail::parse_fastx_file(filename) {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("Error opening file {}: {:?}", filename.display(), err);
+                return Err(format!("Error opening file {}: {:?}", filename.display(), err));
+            }
+        };
+
+        // parse fasta and add to signature
+        while let Some(record_result) = reader.next() {
+            match record_result {
+                Ok(record) => {
+                    for sig in &mut sigs {
+                        if moltype == "protein" {
+                            sig.add_protein(&record.seq()).unwrap();
+                        } else {
+                            sig.add_sequence(&record.seq(), true).unwrap();
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error while processing record: {:?}", err);
+                }
+            }
+        }
+    }
+
+    Ok(sigs)
+}
+
+// pub fn load_fasta_fromfile<P: AsRef<Path>>(
+//     sketchlist_filename: &P,
+// ) -> Result<Vec<(String, PathBuf, String)>> {
+//     let mut rdr = csv::Reader::from_path(sketchlist_filename)?;
+
+//     // Check for right header
+//     let headers = rdr.headers()?;
+//     if headers.len() != 3
+//         || headers.get(0).unwrap() != "name"
+//         || headers.get(1).unwrap() != "genome_filename"
+//         || headers.get(2).unwrap() != "protein_filename"
+//     {
+//         return Err(anyhow!(
+//             "Invalid header. Expected 'name,genome_filename,protein_filename', but got '{}'",
+//             headers.iter().collect::<Vec<_>>().join(",")
+//         ));
+//     }
+
+//     let mut results = Vec::new();
+
+//     let mut row_count = 0;
+//     let mut genome_count = 0;
+//     let mut protein_count = 0;
+//     // Create a HashSet to keep track of processed rows.
+//     let mut processed_rows = std::collections::HashSet::new();
+//     let mut duplicate_count = 0;
+
+//     for result in rdr.records() {
+//         let record = result?;
+
+//         // Skip duplicated rows
+//         let row_string = record.iter().collect::<Vec<_>>().join(",");
+//         if processed_rows.contains(&row_string) {
+//             duplicate_count += 1;
+//             continue;
+//         }
+//         processed_rows.insert(row_string.clone());
+//         row_count += 1;
+//         let name = record
+//             .get(0)
+//             .ok_or_else(|| anyhow!("Missing 'name' field"))?
+//             .to_string();
+
+//         let genome_filename = record
+//             .get(1)
+//             .ok_or_else(|| anyhow!("Missing 'genome_filename' field"))?;
+//         if !genome_filename.is_empty() {
+//             results.push((
+//                 name.clone(),
+//                 PathBuf::from(genome_filename),
+//                 "dna".to_string(),
+//             ));
+//             genome_count += 1;
+//         }
+
+//         let protein_filename = record
+//             .get(2)
+//             .ok_or_else(|| anyhow!("Missing 'protein_filename' field"))?;
+//         if !protein_filename.is_empty() {
+//             results.push((name, PathBuf::from(protein_filename), "protein".to_string()));
+//             protein_count += 1;
+//         }
+//     }
+//     // Print warning if there were duplicated rows.
+//     if duplicate_count > 0 {
+//         println!("Warning: {} duplicated rows were skipped.", duplicate_count);
+//     }
+//     println!(
+//         "Loaded {} rows in total ({} genome and {} protein files)",
+//         row_count, genome_count, protein_count
+//     );
+//     Ok(results)
+// }
 
 /// Load a collection of sketches from a file in parallel.
 pub fn load_sketches(

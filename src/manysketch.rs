@@ -2,13 +2,153 @@
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 
-use crate::utils::{load_fasta_fromfile, sigwriter, Params, ZipMessage};
+use crate::utils::{sigwriter, Params, ZipMessage};
 use needletail::parse_fastx_file;
 use sourmash::cmd::ComputeParameters;
 use sourmash::signature::Signature;
 use std::path::Path;
 use std::sync::atomic;
 use std::sync::atomic::AtomicUsize;
+use std::path::PathBuf;
+
+enum CSVType {
+    Assembly,
+    Reads,
+    Unknown,
+}
+
+fn detect_csv_type(headers: &csv::StringRecord) -> CSVType {
+    if headers.len() == 3
+        && headers.get(0).unwrap() == "name"
+        && headers.get(1).unwrap() == "genome_filename"
+        && headers.get(2).unwrap() == "protein_filename"
+    {
+        CSVType::Assembly
+    } else if headers.len() == 3
+        && headers.get(0).unwrap() == "name"
+        && headers.get(1).unwrap() == "read1"
+        && headers.get(2).unwrap() == "read2"
+    {
+        CSVType::Reads
+    } else {
+        CSVType::Unknown
+    }
+}
+
+pub fn load_fasta_fromfile<P: AsRef<Path>>(
+    sketchlist_filename: &P,
+) -> Result<Vec<(String, Vec<PathBuf>, String)>> {
+    let mut rdr = csv::Reader::from_path(sketchlist_filename)?;
+    let headers = rdr.headers()?;
+
+    match detect_csv_type(&headers) {
+        CSVType::Assembly => process_assembly_csv(rdr),
+        CSVType::Reads => process_reads_csv(rdr),
+        CSVType::Unknown => Err(anyhow!(
+            "Invalid header. Expected 'name,genome_filename,protein_filename' or 'name,read1,read2', but got '{}'",
+            headers.iter().collect::<Vec<_>>().join(",")
+        )),
+    }
+}
+
+fn process_assembly_csv(mut rdr: csv::Reader<std::fs::File>) -> Result<Vec<(String, Vec<PathBuf>, String)>> {
+    let mut results = Vec::new();
+    let mut row_count = 0;
+    let mut genome_count = 0;
+    let mut protein_count = 0;
+    let mut processed_rows = std::collections::HashSet::new();
+    let mut duplicate_count = 0;
+
+    for result in rdr.records() {
+        let record = result?;
+        let row_string = record.iter().collect::<Vec<_>>().join(",");
+        if processed_rows.contains(&row_string) {
+            duplicate_count += 1;
+            continue;
+        }
+        processed_rows.insert(row_string.clone());
+        row_count += 1;
+        let name = record
+            .get(0)
+            .ok_or_else(|| anyhow!("Missing 'name' field"))?
+            .to_string();
+
+        let genome_filename = record
+            .get(1)
+            .ok_or_else(|| anyhow!("Missing 'genome_filename' field"))?;
+        if !genome_filename.is_empty() {
+            results.push((
+                name.clone(),
+                vec![PathBuf::from(genome_filename)],
+                "dna".to_string(),
+            ));
+            genome_count += 1;
+        }
+
+        let protein_filename = record
+            .get(2)
+            .ok_or_else(|| anyhow!("Missing 'protein_filename' field"))?;
+        if !protein_filename.is_empty() {
+            results.push((
+                name,
+                vec![PathBuf::from(protein_filename)],
+                "protein".to_string(),
+            ));
+            protein_count += 1;
+        }
+    }
+
+    if duplicate_count > 0 {
+        println!("Warning: {} duplicated rows were skipped.", duplicate_count);
+    }
+    println!(
+        "Loaded {} rows in total ({} genome and {} protein files)",
+        row_count, genome_count, protein_count
+    );
+
+    Ok(results)
+}
+
+fn process_reads_csv(mut rdr: csv::Reader<std::fs::File>) -> Result<Vec<(String, Vec<PathBuf>, String)>> {
+    let mut results = Vec::new();
+    let mut processed_rows = std::collections::HashSet::new();
+    let mut duplicate_count = 0;
+
+    for result in rdr.records() {
+        let record = result?;
+        let row_string = record.iter().collect::<Vec<_>>().join(",");
+        if processed_rows.contains(&row_string) {
+            duplicate_count += 1;
+            continue;
+        }
+        processed_rows.insert(row_string.clone());
+
+        let name = record
+            .get(0)
+            .ok_or_else(|| anyhow!("Missing 'name' field"))?
+            .to_string();
+
+        let read1 = record
+            .get(1)
+            .ok_or_else(|| anyhow!("Missing 'read1' field"))?;
+        let read2 = record
+            .get(2)
+            .ok_or_else(|| anyhow!("Missing 'read2' field"))?;
+        let paths = vec![
+            PathBuf::from(read1),
+            PathBuf::from(read2),
+        ];
+        results.push((name, paths, "alternate".to_string()));
+    }
+
+    if duplicate_count > 0 {
+        println!("Warning: {} duplicated rows were skipped.", duplicate_count);
+    }
+    println!("Loaded alternate CSV variant.");
+
+    Ok(results)
+}
+
 
 fn parse_params_str(params_strs: String) -> Result<Vec<Params>, String> {
     let mut unique_params: std::collections::HashSet<Params> = std::collections::HashSet::new();
@@ -128,10 +268,113 @@ fn build_siginfo(
     (sigs, params_vec)
 }
 
+
+fn sketch_fastas(
+    filenames: &[PathBuf], 
+    moltype: &str, 
+    name: &str, 
+    params_vec: &[Params]
+) -> Result<(Vec<Signature>, Vec<Params>, PathBuf), String> {
+
+    // initialize signatures once for all files
+    // in sourmash sketch, if merging multiple files, the `filename` ends up being the last file processed.
+    // do we want to mirror that behavior? or is there a better option?
+    let (mut sigs, sig_params) = build_siginfo(&params_vec, moltype, name, &filenames[0]);
+
+    // if no sigs to build, skip
+    if sigs.is_empty() {
+        return Ok((Vec::new(), Vec::new(), filenames[0].clone()));
+    }
+    
+    for filename in filenames.iter() {
+        let mut reader = match needletail::parse_fastx_file(filename) {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!("Error opening file {}: {:?}", filename.display(), err);
+                return Err(format!("Error opening file {}: {:?}", filename.display(), err));
+            }
+        };
+
+        // parse fasta and add to signature
+        while let Some(record_result) = reader.next() {
+            match record_result {
+                Ok(record) => {
+                    for sig in &mut sigs {
+                        if moltype == "protein" {
+                            sig.add_protein(&record.seq()).unwrap();
+                        } else {
+                            sig.add_sequence(&record.seq(), true).unwrap();
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error while processing record: {:?}", err);
+                }
+            }
+        }
+    }
+
+    Ok((sigs, sig_params, filenames[0].clone()))
+}
+
+
+fn sketch_singleton(
+    filename: &PathBuf, 
+    moltype: &str, 
+    name: &str, 
+    params_vec: &[Params]
+) -> Result<(Vec<Signature>, Vec<Params>, PathBuf), String> {
+    
+    let mut reader = match parse_fastx_file(filename) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("Error opening file {}: {:?}", filename.display(), err);
+            return Err(format!("Error opening file {}: {:?}", filename.display(), err));
+        }
+    };
+    //build sig templates
+    let (template_sigs, sig_params) = build_siginfo(&params_vec, moltype, name, filename);
+    // if no sigs to build, skip
+    if template_sigs.is_empty() {
+        return Ok((Vec::new(), Vec::new(), filename.clone()));
+    }
+    
+    let mut all_sigs: Vec<Signature> = vec![];
+    let mut all_sig_params: Vec<Params> = vec![];
+    all_sig_params.extend(sig_params.iter().cloned());
+    
+    
+    // parse fasta and add to a new signature for each record
+    while let Some(record_result) = reader.next() {
+        match record_result {
+            Ok(record) => {
+                // copy template sigs for each record
+                let mut record_sigs = template_sigs.clone();
+                for mut sig in record_sigs.iter_mut() {
+                    if moltype == "protein" {
+                        sig.add_protein(&record.seq()).unwrap();
+                    } else {
+                        sig.add_sequence(&record.seq(), true).unwrap();
+                    }
+                }
+                all_sigs.extend(record_sigs);
+            }
+            Err(err) => {
+                eprintln!("Error while processing record: {:?}", err);
+            }
+        }
+    }
+
+    Ok((all_sigs, all_sig_params, filename.clone()))
+}
+
+
+
 pub fn manysketch<P: AsRef<Path> + Sync>(
     filelist: P,
     param_str: String,
     output: String,
+    singleton: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fileinfo = match load_fasta_fromfile(&filelist) {
         Ok(result) => result,
@@ -179,75 +422,62 @@ pub fn manysketch<P: AsRef<Path> + Sync>(
     let reporting_threshold = std::cmp::max(n_fastas / 20, 1);
 
     let send_result = fileinfo
-        .par_iter()
-        .filter_map(|(name, filename, moltype)| {
-            // increment processed_fastas counter; make 1-based for % reporting
-            let i = processed_fastas.fetch_add(1, atomic::Ordering::SeqCst);
-            // progress report at threshold
-            if (i + 1) % reporting_threshold == 0 {
-                let percent_processed = (((i + 1) as f64 / n_fastas as f64) * 100.0).round();
-                eprintln!(
-                    "Starting file {}/{} ({}%)",
-                    (i + 1),
-                    n_fastas,
-                    percent_processed
-                );
+    .par_iter()
+    .filter_map(|(name, filenames, moltype)| {
+        // increment processed_fastas counter; make 1-based for % reporting
+        let i = processed_fastas.fetch_add(1, atomic::Ordering::SeqCst);
+        
+        // progress report at threshold
+        if (i + 1) % reporting_threshold == 0 {
+            let percent_processed = (((i + 1) as f64 / n_fastas as f64) * 100.0).round();
+            eprintln!(
+                "Starting file {}/{} ({}%)",
+                (i + 1),
+                n_fastas,
+                percent_processed
+            );
+        }
+        
+        let (sigs, sig_params, filename) = if singleton {
+            sketch_singleton(filenames, moltype, name, &params_vec).unwrap_or_default()
+        } else {
+            sketch_fastas(filenames, moltype, name, &params_vec).unwrap_or_default()
+        };
+        
+        // if no sigs to build, skip
+        if sigs.is_empty() {
+            let _ = skipped_paths.fetch_add(1, atomic::Ordering::SeqCst);
+            return None;
+        }
+        
+        Some((sigs, sig_params, filename))
+    })
+    .try_for_each_with(
+        send.clone(),
+        |s: &mut std::sync::Arc<std::sync::mpsc::SyncSender<ZipMessage>>,
+         (sigs, sig_params, filename)| {
+            if let Err(e) = s.send(ZipMessage::SignatureData(
+                sigs,
+                sig_params,
+                filename.clone(),
+            )) {
+                Err(format!("Unable to send internal data: {:?}", e))
+            } else {
+                Ok(())
             }
+        },
+    );
+This assumes:
 
-            // build sig templates from params
-            let (mut sigs, sig_params) = build_siginfo(&params_vec, moltype, name, filename);
-            // if no sigs to build, skip
-            if sigs.is_empty() {
-                let _ = skipped_paths.fetch_add(1, atomic::Ordering::SeqCst);
-                return None;
-            }
+Both sketch_singleton and sketch_fastas return Result<(Vec<Signature>, Vec<SigParams>, PathBuf), SomeErrorType> where SomeErrorType is the error type of the functions.
+SomeErrorType implements the default trait or you provide a suitable default.
+Note: I've added .unwrap_or_default() for handling errors returned from the sketch functions. This will panic if there's an error. Depending on your application, you might want to replace this with a proper error-handling strategy.
 
-            // Open fasta file reader
-            let mut reader = match parse_fastx_file(filename) {
-                Ok(r) => r,
-                Err(err) => {
-                    eprintln!("Error opening file {}: {:?}", filename.display(), err);
-                    let _ = failed_paths.fetch_add(1, atomic::Ordering::SeqCst);
-                    return None;
-                }
-            };
-            // parse fasta and add to signature
-            while let Some(record_result) = reader.next() {
-                match record_result {
-                    Ok(record) => {
-                        // do we need to normalize to make sure all the bases are consistently capitalized?
-                        // let norm_seq = record.normalize(false);
-                        for sig in &mut sigs {
-                            if moltype == "protein" {
-                                sig.add_protein(&record.seq()).unwrap();
-                            } else {
-                                sig.add_sequence(&record.seq(), true).unwrap();
-                                // if not force, panics with 'N' in dna sequence
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("Error while processing record: {:?}", err);
-                    }
-                }
-            }
-            Some((sigs, sig_params, filename))
-        })
-        .try_for_each_with(
-            send.clone(),
-            |s: &mut std::sync::Arc<std::sync::mpsc::SyncSender<ZipMessage>>,
-             (sigs, sig_params, filename)| {
-                if let Err(e) = s.send(ZipMessage::SignatureData(
-                    sigs,
-                    sig_params,
-                    filename.clone(),
-                )) {
-                    Err(format!("Unable to send internal data: {:?}", e))
-                } else {
-                    Ok(())
-                }
-            },
-        );
+
+
+
+
+
 
     // After the parallel work, send the WriteManifest message
     std::sync::Arc::try_unwrap(send)
